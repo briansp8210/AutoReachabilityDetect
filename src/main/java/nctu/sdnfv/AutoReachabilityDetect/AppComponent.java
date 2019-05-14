@@ -54,6 +54,9 @@ import org.onlab.packet.Ip4Address;
 import org.onlab.packet.IPv4;
 import org.onlab.packet.ICMP;
 import org.onlab.packet.ICMPEcho;
+import org.onlab.packet.TCP;
+import org.onlab.packet.TpPort;
+import org.onlab.packet.UDP;
 import java.nio.ByteBuffer;
 import java.util.Timer;
 import java.util.TimerTask;
@@ -88,21 +91,29 @@ public class AppComponent implements AppComponentService {
     private ApplicationId appId;
     private PktProcessor processor = new PktProcessor();
 
-    private Timer timer = new Timer();
-    private TimeoutHandler handler;
-
-    private static short ident = 0;
-    private static short seqNum = 0;
-
     private Ip4Address srcIP;
     private Ip4Address dstIP;
-    private static final int DEFAULT_MAX_COUNT = 3;
-    private static final int DEFAULT_TIMEOUT_SECOND = 3;
-    private int count;
-    private int sent;
-    private int timeout;
+    private DeviceId srcDevId;
+    private Timer timer = new Timer();
 
+    // For handling ICMP data.
+    private static final int DEFAULT_MAX_COUNT = 5;
+    private static final int DEFAULT_TIMEOUT_SECOND = 2;
     private CountDownLatch latch;
+    private int count;
+    private int timeout;
+    private int sent;
+    private static short icmpIdent = 0;
+    private static short icmpSeqNum = 0;
+    private ICMPTimeoutHandler icmpTimeoutHandler;
+
+    // For handling TCP data.
+    private static final short TCP_SYN_MASK = 0x0002;
+    private static final short TCP_ACK_MASK = 0x0010;
+    private static final int TCP_DEFAULT_TIMEOUT = 5;
+    private boolean hasSynAcked;
+    private int expSeq;
+    private TCPTimeoutHandler tcpHandler;
 
     @Activate
     protected void activate() {
@@ -119,9 +130,25 @@ public class AppComponent implements AppComponentService {
         log.info("Stopped");
     }
 
-    public void ping(String srcIP, String dstIP, int count, int timeout) {
+    public void detect(Protocol proto, String srcIP, String dstIP) {
         this.srcIP = Ip4Address.valueOf(srcIP);
         this.dstIP = Ip4Address.valueOf(dstIP);
+        srcDevId = hostService.getHostsByIp(this.srcIP).iterator().next()
+                .location().deviceId();
+        switch (proto) {
+            case kICMP:
+                icmpDetector(DEFAULT_MAX_COUNT, DEFAULT_TIMEOUT_SECOND);
+                break;
+            case kTCP:
+                tcpDetector();
+                break;
+            case kUDP:
+                udpDetector();
+                break;
+        }
+    }
+
+    private void icmpDetector(int count, int timeout) {
         this.timeout = timeout == 0 ? DEFAULT_TIMEOUT_SECOND : timeout;
         this.count = count == 0 ? DEFAULT_MAX_COUNT : count;
         sent = 0;
@@ -130,33 +157,30 @@ public class AppComponent implements AppComponentService {
         log.info("+++++++++++++++++++++++++++++++++++++++++++++++++");
         log.info(srcIP.toString() + " PING " + dstIP.toString());
 
-        installRule(this.dstIP, this.srcIP);
-        installRule(this.srcIP, this.dstIP);
+        installIcmpRule(this.dstIP, this.srcIP);
+        installIcmpRule(this.srcIP, this.dstIP);
         log.info("installing rules...");
         waitRulesInstallation();
-        internalPing();
+        ping();
         try {
             latch.await();
         } catch (InterruptedException e) {};
         flowRuleService.removeFlowRulesById(appId);
     }
 
-    private void internalPing() {
+    private void ping() {
         if (++sent > count) {
             log.info("+++++++++++++++++++++++++++++++++++++++++++++++++");
             return;
         }
-        handler = new TimeoutHandler();
-        timer.schedule(handler, timeout * 1000);
+        icmpTimeoutHandler = new ICMPTimeoutHandler();
+        timer.schedule(icmpTimeoutHandler, timeout * 1000);
         log.info("-------------------------------------------------");
-        log.info("Send ECHO to " + dstIP.toString() + ", icmp_seq = " + (seqNum + 1));
+        log.info("Send Echo-Request to " + dstIP.toString() + ", icmp_seq = " + (icmpSeqNum + 1));
         sendIcmpEchoPkt(srcIP, dstIP);
     }
 
-    private void installRule(Ip4Address src, Ip4Address dst) {
-        Host srcHost = hostService.getHostsByIp(srcIP).iterator().next();
-        DeviceId deviceId = srcHost.location().deviceId();
-
+    private void installIcmpRule(Ip4Address src, Ip4Address dst) {
         TrafficSelector selector = DefaultTrafficSelector.builder()
                 .matchEthType(Ethernet.TYPE_IPV4)
                 .matchIPProtocol(IPv4.PROTOCOL_ICMP)
@@ -176,46 +200,178 @@ public class AppComponent implements AppComponentService {
                 .withFlag(ForwardingObjective.Flag.VERSATILE)
                 .fromApp(appId)
                 .add();
-        
-        flowObjectiveService.forward(deviceId, forwardingObjective);
+
+        flowObjectiveService.forward(srcDevId, forwardingObjective);
+    }
+
+    private void tcpDetector() {
+        hasSynAcked = false;
+        // Aim to capture SYN-ACK packet.
+        installTcpRule(dstIP, srcIP);
+    }
+
+    private void udpDetector() {
+        installUdpRule(dstIP, srcIP);
+    }
+
+    private void installTcpRule(Ip4Address ipv4Src, Ip4Address ipv4Dst) {
+        TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder()
+                .matchEthType(Ethernet.TYPE_IPV4)
+                .matchIPProtocol(IPv4.PROTOCOL_TCP)
+                .matchIPSrc(Ip4Prefix.valueOf(ipv4Src, Ip4Prefix.MAX_MASK_LENGTH))
+                .matchIPDst(Ip4Prefix.valueOf(ipv4Dst, Ip4Prefix.MAX_MASK_LENGTH));
+        if (ipv4Src.equals(srcIP)) {
+            selectorBuilder.matchTcpDst(TpPort.tpPort(5001));
+        } else {
+            selectorBuilder.matchTcpSrc(TpPort.tpPort(5001));
+        }
+
+        TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                .setOutput(PortNumber.CONTROLLER)
+                .build();
+
+        ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+                .withSelector(selectorBuilder.build())
+                .withTreatment(treatment)
+                .withPriority(PacketPriority.MAX.priorityValue())
+                .withFlag(ForwardingObjective.Flag.VERSATILE)
+                .fromApp(appId)
+                .add();
+
+        flowObjectiveService.forward(srcDevId, forwardingObjective);
+    }
+
+    private void installUdpRule(Ip4Address ipv4Src, Ip4Address ipv4Dst) {
+        TrafficSelector selector = DefaultTrafficSelector.builder()
+                .matchEthType(Ethernet.TYPE_IPV4)
+                .matchIPProtocol(IPv4.PROTOCOL_UDP)
+                .matchIPSrc(Ip4Prefix.valueOf(ipv4Src, Ip4Prefix.MAX_MASK_LENGTH))
+                .matchIPDst(Ip4Prefix.valueOf(ipv4Dst, Ip4Prefix.MAX_MASK_LENGTH))
+                .matchUdpSrc(TpPort.tpPort(5001))
+                .build();
+
+        TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                .setOutput(PortNumber.CONTROLLER)
+                .build();
+
+        ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+                .withSelector(selector)
+                .withTreatment(treatment)
+                .withPriority(PacketPriority.MAX.priorityValue())
+                .withFlag(ForwardingObjective.Flag.VERSATILE)
+                .fromApp(appId)
+                .add();
+
+        flowObjectiveService.forward(srcDevId, forwardingObjective);
     }
 
     private void waitRulesInstallation() {
-        Host srcHost = hostService.getHostsByIp(srcIP).iterator().next();
-        DeviceId deviceId = srcHost.location().deviceId();
         while (flowRuleService.getFlowEntriesByState(
-                    deviceId,
-                    FlowEntry.FlowEntryState.PENDING_ADD).iterator().hasNext());
+                srcDevId,
+                FlowEntry.FlowEntryState.PENDING_ADD).iterator().hasNext());
+    }
+
+    private void waitRulesRemoval() {
+        while (flowRuleService.getFlowEntriesByState(
+                srcDevId,
+                FlowEntry.FlowEntryState.PENDING_REMOVE).iterator().hasNext());
     }
 
     private class PktProcessor implements PacketProcessor {
+        private PacketContext context;
+        private Ethernet ethPkt;
+        private IPv4 ipv4Pkt;
+        private Ip4Address ipv4Src;
+        private Ip4Address ipv4Dst;
+
         @Override
         public void process(PacketContext context) {
-            InboundPacket pkt = context.inPacket();
-            Ethernet ethPkt = pkt.parsed();
-
+            this.context = context;
+            ethPkt = context.inPacket().parsed();
             if (ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
-                IPv4 ipv4Pkt = (IPv4)ethPkt.getPayload();
-                Ip4Address from = Ip4Address.valueOf(ipv4Pkt.getSourceAddress());
-                Ip4Address to = Ip4Address.valueOf(ipv4Pkt.getDestinationAddress());
-                ICMP icmpPkt = (ICMP)ipv4Pkt.getPayload();
-                int icmpSeq = ((ICMPEcho)icmpPkt.getPayload()).getSequenceNum();
+                ipv4Pkt = (IPv4)ethPkt.getPayload();
+                ipv4Src = Ip4Address.valueOf(ipv4Pkt.getSourceAddress());
+                ipv4Dst = Ip4Address.valueOf(ipv4Pkt.getDestinationAddress());
 
-                if (ipv4Pkt.getProtocol() == IPv4.PROTOCOL_ICMP &&
-                        icmpPkt.getIcmpType() == ICMP.TYPE_ECHO_REPLY &&
-                        icmpSeq == seqNum) {
-                    if (from.equals(dstIP) && to.equals(srcIP)) {
-                        log.info("Recv REPLY from " + dstIP.toString() + ", icmp_seq = " + icmpSeq);
-                        log.info("Send ECHO to " + srcIP.toString() + ", icmp_seq = " + (seqNum + 1));
-                        sendIcmpEchoPkt(dstIP, srcIP);
-                    } else if (from.equals(srcIP) && to.equals(dstIP)) {
-                        handler.cancel();
-                        log.info("reachability approved!, icmp_seq = " + icmpSeq);
-                        log.info("-------------------------------------------------");
-                        latch.countDown();
-                        internalPing();
-                    }
+                if (ipv4Pkt.getProtocol() == IPv4.PROTOCOL_ICMP) {
+                    icmpProcessor();
+                } else if (ipv4Pkt.getProtocol() == IPv4.PROTOCOL_TCP) {
+                    tcpProcessor();
+                } else if (ipv4Pkt.getProtocol() == IPv4.PROTOCOL_UDP) {
+                    udpProcessor();
                 }
+            }
+            context.block();
+        }
+
+        private void icmpProcessor() {
+            ICMP icmpPkt = (ICMP)ipv4Pkt.getPayload();
+            int seqNum = ((ICMPEcho)icmpPkt.getPayload()).getSequenceNum();
+            if (icmpPkt.getIcmpType() == ICMP.TYPE_ECHO_REPLY && seqNum == icmpSeqNum) {
+                if (ipv4Src.equals(dstIP) && ipv4Dst.equals(srcIP)) {
+                    log.info("Recv REPLY from {}, icmp_seq = {}", dstIP.toString(), seqNum);
+                    log.info("Send ECHO to {}, icmp_seq = {}", srcIP.toString(), (icmpSeqNum + 1));
+                    sendIcmpEchoPkt(dstIP, srcIP);
+                } else if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP)) {
+                    icmpTimeoutHandler.cancel();
+                    log.info("Reachability approved!, icmp_seq = {}", seqNum);
+                    latch.countDown();
+                    ping();
+                }
+            }
+        }
+
+        private void tcpProcessor() {
+            TCP tcpPkt = (TCP)ipv4Pkt.getPayload();
+            int tcpSeqNum = tcpPkt.getSequence();
+            int tcpAckNum = tcpPkt. getAcknowledge();
+            boolean isSYN = (tcpPkt.getFlags() & TCP_SYN_MASK) != 0;
+            boolean isACK = (tcpPkt.getFlags() & TCP_ACK_MASK) != 0;
+
+            if (!hasSynAcked && isSYN && isACK) {
+                hasSynAcked = true;
+                expSeq = tcpAckNum;
+                flowRuleService.removeFlowRulesById(appId);
+                //waitRulesRemoval();
+                // Aim to capture ACK packet, which completes handshaking.
+                installTcpRule(srcIP, dstIP);
+                //waitRulesInstallation();
+                log.info("-------------------------------------------------");
+                log.info("RECV SYN-ACK");
+                log.info("TCP FLAGS: {}", tcpPkt.getFlags());
+                log.info("TCP SEQNM: {}", Integer.toUnsignedString(tcpSeqNum));
+                log.info("TCP ACKNM: {}", Integer.toUnsignedString(tcpAckNum));
+                tcpHandler = new TCPTimeoutHandler();
+                timer.schedule(tcpHandler, TCP_DEFAULT_TIMEOUT * 1000);
+            } else if (!isSYN && isACK && tcpSeqNum == expSeq) {
+                tcpHandler.cancel();
+                log.info("RECV ACK");
+                log.info("TCP FLAGS: {}", tcpPkt.getFlags());
+                log.info("TCP SEQUE: {}", Integer.toUnsignedString(tcpSeqNum));
+                log.info("TCP ACKNM: {}", Integer.toUnsignedString(tcpAckNum));
+                log.info("-------------------------------------------------");
+                flowRuleService.removeFlowRulesById(appId);
+            }
+            packetOut(context, PortNumber.TABLE);
+        }
+
+        private void udpProcessor() {
+            UDP udpPkt = (UDP)ipv4Pkt.getPayload();
+            if (ipv4Src.equals(dstIP) && ipv4Dst.equals(srcIP)) {
+                log.info("**************************************");
+                log.info("UDP pass phase1");
+                flowRuleService.removeFlowRulesById(appId);
+                installUdpRule(srcIP, dstIP);
+                try {
+                    Thread.sleep(5000);
+                } catch(InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                }
+            } else if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP)) {
+                log.info("UDP DSTPORT: " + udpPkt.getDestinationPort());
+                log.info("UDP pass phase2");
+                log.info("**************************************");
+                flowRuleService.removeFlowRulesById(appId);
             }
         }
     }
@@ -225,17 +381,17 @@ public class AppComponent implements AppComponentService {
         Host dstHost = hostService.getHostsByIp(dst).iterator().next();
 
         ICMPEcho echo = new ICMPEcho()
-                .setIdentifier(++ident)
-                .setSequenceNum(++seqNum);
+                .setIdentifier(++icmpIdent)
+                .setSequenceNum(++icmpSeqNum);
         ICMP icmpPkt = (ICMP) new ICMP()
                 .setIcmpType(ICMP.TYPE_ECHO_REQUEST)
                 .setIcmpCode(ICMP.CODE_ECHO_REQEUST)
-                .setChecksum((short) 0)
+                //.setChecksum((short) 0)
                 .setPayload(echo);
         IPv4 ipv4Pkt = (IPv4) new IPv4()
                 .setDscp((byte) 0)
                 .setEcn((byte) 0)
-                .setIdentification(ident)
+                .setIdentification(icmpIdent)
                 .setFlags((byte) 2)
                 .setTtl((byte) 64)
                 .setProtocol(IPv4.PROTOCOL_ICMP)
@@ -255,13 +411,25 @@ public class AppComponent implements AppComponentService {
         packetService.emit(pkt);
     }
 
-    private class TimeoutHandler extends TimerTask {
+    private void packetOut(PacketContext context, PortNumber outPort) {
+        context.treatmentBuilder().setOutput(outPort);
+        context.send();
+    }
+
+    private class ICMPTimeoutHandler extends TimerTask {
         @Override
         public void run() {
-            log.info("TIMEOUT!");
-            log.info("-------------------------------------------------");
+            log.info("icmp_seq = {}, TIMEOUT!", icmpSeqNum);
             latch.countDown();
-            internalPing();
+            ping();
+        }
+    }
+
+    private class TCPTimeoutHandler extends TimerTask {
+        @Override
+        public void run() {
+            log.info("{} TIMEOUT!", hasSynAcked ? "SYN-ACK" : "ACK");
+            log.info("-------------------------------------------------");
         }
     }
 }

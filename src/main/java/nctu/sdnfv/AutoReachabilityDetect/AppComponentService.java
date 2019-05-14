@@ -16,5 +16,8 @@
 package nctu.sdnfv.AutoReachabilityDetect;
 
 public interface AppComponentService {
-    public void ping(String srcIP, String dstIP, int count, int timeout);
+    public enum Protocol {
+        kICMP, kTCP, kUDP
+    }
+    public void detect(Protocol proto, String srcIP, String dstIP);
 }

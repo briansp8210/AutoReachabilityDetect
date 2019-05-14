@@ -21,19 +21,22 @@ import org.apache.karaf.shell.commands.Option;
 import org.onlab.packet.Ip4Address;
 import org.onosproject.cli.AbstractShellCommand;
 import nctu.sdnfv.AutoReachabilityDetect.AppComponentService;
-
+import nctu.sdnfv.AutoReachabilityDetect.AppComponentService.Protocol;
 
 /**
  * Sample Apache Karaf CLI command
  */
-@Command(scope = "onos", name = "ping",
+@Command(scope = "onos", name = "detect",
          description = "Sample Apache Karaf CLI command")
 public class AppCommand extends AbstractShellCommand {
 
-    @Argument(index = 0, name = "source", required = true)
+    @Argument(index = 0, name = "protocol", required = true)
+    String proto;
+
+    @Argument(index = 1, name = "source", required = true)
     String srcIP;
 
-    @Argument(index = 1, name = "destination", required = true)
+    @Argument(index = 2, name = "destination", required = true)
     String dstIP;
 
     @Option(name = "-c", description = "Number of ECHO packets to send.",
@@ -47,6 +50,18 @@ public class AppCommand extends AbstractShellCommand {
     @Override
     protected void execute() {
         AppComponentService app = get(AppComponentService.class);
-        app.ping(srcIP, dstIP, count, timeout);
+        switch (proto) {
+            case "icmp":
+                app.detect(Protocol.kICMP, srcIP, dstIP);
+                break;
+            case "tcp":
+                app.detect(Protocol.kTCP, srcIP, dstIP);
+                break;
+            case "udp":
+                app.detect(Protocol.kUDP, srcIP, dstIP);
+                break;
+            default:
+                System.err.println(proto + " is unsupported");
+        }
     }
 }
