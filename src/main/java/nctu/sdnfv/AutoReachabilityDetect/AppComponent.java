@@ -26,12 +26,10 @@ import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.onosproject.core.CoreService;
 import org.onosproject.core.ApplicationId;
-import org.onosproject.net.packet.InboundPacket;
 import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketProcessor;
 import org.onosproject.net.packet.PacketService;
 import org.onosproject.net.packet.PacketPriority;
-import org.onosproject.net.packet.OutboundPacket;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.flow.DefaultTrafficSelector;
 import org.onosproject.net.flow.TrafficSelector;
@@ -90,6 +88,7 @@ public class AppComponent implements AppComponentService {
 
     private ApplicationId appId;
     private PktProcessor processor = new PktProcessor();
+    private boolean enableDetection = false;
 
     private Ip4Address srcIP;
     private Ip4Address dstIP;
@@ -97,7 +96,7 @@ public class AppComponent implements AppComponentService {
     private Timer timer = new Timer();
 
     // For handling ICMP data.
-    private static final int DEFAULT_MAX_COUNT = 5;
+    private static final int DEFAULT_MAX_COUNT = 3;
     private static final int DEFAULT_TIMEOUT_SECOND = 2;
     private CountDownLatch latch;
     private int count;
@@ -105,20 +104,23 @@ public class AppComponent implements AppComponentService {
     private int sent;
     private static short icmpIdent = 0;
     private static short icmpSeqNum = 0;
-    private ICMPTimeoutHandler icmpTimeoutHandler;
+    private boolean recvDst;
+    private IcmpTimeoutHandler icmpTimeoutHandler;
 
     // For handling TCP data.
     private static final short TCP_SYN_MASK = 0x0002;
-    private static final short TCP_ACK_MASK = 0x0010;
     private static final int TCP_DEFAULT_TIMEOUT = 5;
-    private boolean hasSynAcked;
-    private int expSeq;
-    private TCPTimeoutHandler tcpHandler;
+    private TcpTimeoutHandler tcpTimeoutHandler;
+
+    // For handling UDP data.
+    private static final int UDP_DEFAULT_TIMEOUT = 20;
+    private UdpTimeoutHandler udpTimeoutHandler;
+    private boolean recvDstAck = false;
 
     @Activate
     protected void activate() {
         appId = coreService.registerApplication("nctu.sdnfv.AutoReachabilityDetect");
-        packetService.addProcessor(processor, PacketProcessor.director(2));
+        packetService.addProcessor(processor, PacketProcessor.director(10));
         log.info("Started");
     }
 
@@ -131,6 +133,7 @@ public class AppComponent implements AppComponentService {
     }
 
     public void detect(Protocol proto, String srcIP, String dstIP) {
+        enableDetection = true;
         this.srcIP = Ip4Address.valueOf(srcIP);
         this.dstIP = Ip4Address.valueOf(dstIP);
         srcDevId = hostService.getHostsByIp(this.srcIP).iterator().next()
@@ -153,9 +156,11 @@ public class AppComponent implements AppComponentService {
         this.count = count == 0 ? DEFAULT_MAX_COUNT : count;
         sent = 0;
         latch = new CountDownLatch(this.count);
+        icmpIdent = 0;
+        icmpSeqNum = 0;
 
-        log.info("+++++++++++++++++++++++++++++++++++++++++++++++++");
-        log.info(srcIP.toString() + " PING " + dstIP.toString());
+        log.info("+++++++++++++++++++ IP  TEST +++++++++++++++++++");
+        log.info("{} PING {}", srcIP, dstIP);
 
         installIcmpRule(this.dstIP, this.srcIP);
         installIcmpRule(this.srcIP, this.dstIP);
@@ -170,13 +175,15 @@ public class AppComponent implements AppComponentService {
 
     private void ping() {
         if (++sent > count) {
-            log.info("+++++++++++++++++++++++++++++++++++++++++++++++++");
+            log.info("++++++++++++++++++++++++++++++++++++++++++++++++");
+            enableDetection = false;
             return;
         }
-        icmpTimeoutHandler = new ICMPTimeoutHandler();
+        recvDst = false;
+        icmpTimeoutHandler = new IcmpTimeoutHandler();
         timer.schedule(icmpTimeoutHandler, timeout * 1000);
-        log.info("-------------------------------------------------");
-        log.info("Send Echo-Request to " + dstIP.toString() + ", icmp_seq = " + (icmpSeqNum + 1));
+        log.info("------------------------------------------------");
+        log.info("Send ECHO to {}, icmp_seq = {}", dstIP, (icmpSeqNum + 1));
         sendIcmpEchoPkt(srcIP, dstIP);
     }
 
@@ -205,26 +212,19 @@ public class AppComponent implements AppComponentService {
     }
 
     private void tcpDetector() {
-        hasSynAcked = false;
-        // Aim to capture SYN-ACK packet.
-        installTcpRule(dstIP, srcIP);
+        installTcpRule();
+        tcpTimeoutHandler = new TcpTimeoutHandler();
+        timer.schedule(tcpTimeoutHandler, TCP_DEFAULT_TIMEOUT * 1000);
+        log.info("------------------- TCP TEST -------------------");
     }
 
-    private void udpDetector() {
-        installUdpRule(dstIP, srcIP);
-    }
-
-    private void installTcpRule(Ip4Address ipv4Src, Ip4Address ipv4Dst) {
+    private void installTcpRule() {
         TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder()
                 .matchEthType(Ethernet.TYPE_IPV4)
                 .matchIPProtocol(IPv4.PROTOCOL_TCP)
-                .matchIPSrc(Ip4Prefix.valueOf(ipv4Src, Ip4Prefix.MAX_MASK_LENGTH))
-                .matchIPDst(Ip4Prefix.valueOf(ipv4Dst, Ip4Prefix.MAX_MASK_LENGTH));
-        if (ipv4Src.equals(srcIP)) {
-            selectorBuilder.matchTcpDst(TpPort.tpPort(5001));
-        } else {
-            selectorBuilder.matchTcpSrc(TpPort.tpPort(5001));
-        }
+                .matchIPSrc(Ip4Prefix.valueOf(srcIP, Ip4Prefix.MAX_MASK_LENGTH))
+                .matchIPDst(Ip4Prefix.valueOf(dstIP, Ip4Prefix.MAX_MASK_LENGTH))
+                .matchTcpDst(TpPort.tpPort(5001));
 
         TrafficTreatment treatment = DefaultTrafficTreatment.builder()
                 .setOutput(PortNumber.CONTROLLER)
@@ -239,6 +239,15 @@ public class AppComponent implements AppComponentService {
                 .add();
 
         flowObjectiveService.forward(srcDevId, forwardingObjective);
+    }
+
+    private void udpDetector() {
+        recvDstAck = false;
+        udpTimeoutHandler = new UdpTimeoutHandler();
+        installUdpRule(dstIP, srcIP);
+        installUdpRule(srcIP, dstIP);
+        timer.schedule(udpTimeoutHandler, UDP_DEFAULT_TIMEOUT * 1000);
+        log.info("------------------- UDP TEST -------------------");
     }
 
     private void installUdpRule(Ip4Address ipv4Src, Ip4Address ipv4Dst) {
@@ -271,12 +280,6 @@ public class AppComponent implements AppComponentService {
                 FlowEntry.FlowEntryState.PENDING_ADD).iterator().hasNext());
     }
 
-    private void waitRulesRemoval() {
-        while (flowRuleService.getFlowEntriesByState(
-                srcDevId,
-                FlowEntry.FlowEntryState.PENDING_REMOVE).iterator().hasNext());
-    }
-
     private class PktProcessor implements PacketProcessor {
         private PacketContext context;
         private Ethernet ethPkt;
@@ -286,6 +289,9 @@ public class AppComponent implements AppComponentService {
 
         @Override
         public void process(PacketContext context) {
+            if (!enableDetection) {
+                return;
+            }
             this.context = context;
             ethPkt = context.inPacket().parsed();
             if (ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
@@ -301,7 +307,6 @@ public class AppComponent implements AppComponentService {
                     udpProcessor();
                 }
             }
-            context.block();
         }
 
         private void icmpProcessor() {
@@ -309,12 +314,13 @@ public class AppComponent implements AppComponentService {
             int seqNum = ((ICMPEcho)icmpPkt.getPayload()).getSequenceNum();
             if (icmpPkt.getIcmpType() == ICMP.TYPE_ECHO_REPLY && seqNum == icmpSeqNum) {
                 if (ipv4Src.equals(dstIP) && ipv4Dst.equals(srcIP)) {
-                    log.info("Recv REPLY from {}, icmp_seq = {}", dstIP.toString(), seqNum);
-                    log.info("Send ECHO to {}, icmp_seq = {}", srcIP.toString(), (icmpSeqNum + 1));
+                    recvDst = true;
+                    log.info("Send ECHO to {}, icmp_seq = {}", srcIP, (icmpSeqNum + 1));
                     sendIcmpEchoPkt(dstIP, srcIP);
                 } else if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP)) {
+                    recvDst = false;
                     icmpTimeoutHandler.cancel();
-                    log.info("Reachability approved!, icmp_seq = {}", seqNum);
+                    log.info("------------------- [ PASS ] -------------------");
                     latch.countDown();
                     ping();
                 }
@@ -323,54 +329,29 @@ public class AppComponent implements AppComponentService {
 
         private void tcpProcessor() {
             TCP tcpPkt = (TCP)ipv4Pkt.getPayload();
-            int tcpSeqNum = tcpPkt.getSequence();
-            int tcpAckNum = tcpPkt. getAcknowledge();
             boolean isSYN = (tcpPkt.getFlags() & TCP_SYN_MASK) != 0;
-            boolean isACK = (tcpPkt.getFlags() & TCP_ACK_MASK) != 0;
-
-            if (!hasSynAcked && isSYN && isACK) {
-                hasSynAcked = true;
-                expSeq = tcpAckNum;
+            if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP) && !isSYN) {
+                tcpTimeoutHandler.cancel();
+                log.info("3-way handshaking has completed");
+                log.info("------------------- [ PASS ] -------------------");
                 flowRuleService.removeFlowRulesById(appId);
-                //waitRulesRemoval();
-                // Aim to capture ACK packet, which completes handshaking.
-                installTcpRule(srcIP, dstIP);
-                //waitRulesInstallation();
-                log.info("-------------------------------------------------");
-                log.info("RECV SYN-ACK");
-                log.info("TCP FLAGS: {}", tcpPkt.getFlags());
-                log.info("TCP SEQNM: {}", Integer.toUnsignedString(tcpSeqNum));
-                log.info("TCP ACKNM: {}", Integer.toUnsignedString(tcpAckNum));
-                tcpHandler = new TCPTimeoutHandler();
-                timer.schedule(tcpHandler, TCP_DEFAULT_TIMEOUT * 1000);
-            } else if (!isSYN && isACK && tcpSeqNum == expSeq) {
-                tcpHandler.cancel();
-                log.info("RECV ACK");
-                log.info("TCP FLAGS: {}", tcpPkt.getFlags());
-                log.info("TCP SEQUE: {}", Integer.toUnsignedString(tcpSeqNum));
-                log.info("TCP ACKNM: {}", Integer.toUnsignedString(tcpAckNum));
-                log.info("-------------------------------------------------");
-                flowRuleService.removeFlowRulesById(appId);
+                enableDetection = false;
             }
-            packetOut(context, PortNumber.TABLE);
         }
 
         private void udpProcessor() {
             UDP udpPkt = (UDP)ipv4Pkt.getPayload();
-            if (ipv4Src.equals(dstIP) && ipv4Dst.equals(srcIP)) {
-                log.info("**************************************");
-                log.info("UDP pass phase1");
-                flowRuleService.removeFlowRulesById(appId);
-                installUdpRule(srcIP, dstIP);
-                try {
-                    Thread.sleep(5000);
-                } catch(InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                }
-            } else if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP)) {
-                log.info("UDP DSTPORT: " + udpPkt.getDestinationPort());
-                log.info("UDP pass phase2");
-                log.info("**************************************");
+            int udpSrcPort = udpPkt.getSourcePort();
+            if (ipv4Src.equals(dstIP) && ipv4Dst.equals(srcIP) && udpSrcPort == 5001) {
+                udpTimeoutHandler.cancel();
+                log.info("Receive ACK from {}", dstIP);
+                recvDstAck = true;
+                udpTimeoutHandler = new UdpTimeoutHandler();
+                timer.schedule(udpTimeoutHandler, UDP_DEFAULT_TIMEOUT * 1000);
+            } else if (ipv4Src.equals(srcIP) && ipv4Dst.equals(dstIP) && udpSrcPort == 5001) {
+                udpTimeoutHandler.cancel();
+                log.info("Receive ACK from {}", srcIP);
+                log.info("------------------- [ PASS ] -------------------");
                 flowRuleService.removeFlowRulesById(appId);
             }
         }
@@ -386,7 +367,6 @@ public class AppComponent implements AppComponentService {
         ICMP icmpPkt = (ICMP) new ICMP()
                 .setIcmpType(ICMP.TYPE_ECHO_REQUEST)
                 .setIcmpCode(ICMP.CODE_ECHO_REQEUST)
-                //.setChecksum((short) 0)
                 .setPayload(echo);
         IPv4 ipv4Pkt = (IPv4) new IPv4()
                 .setDscp((byte) 0)
@@ -416,20 +396,39 @@ public class AppComponent implements AppComponentService {
         context.send();
     }
 
-    private class ICMPTimeoutHandler extends TimerTask {
+    private class IcmpTimeoutHandler extends TimerTask {
         @Override
         public void run() {
-            log.info("icmp_seq = {}, TIMEOUT!", icmpSeqNum);
+            if (!recvDst) {
+                log.info("{} --> {} may fail, even reversely", srcIP, dstIP);
+            } else {
+                log.info("{} <-- {} may fail", srcIP, dstIP);
+            }
+            log.info("------------------ [ FAILED ] ------------------");
             latch.countDown();
             ping();
         }
     }
 
-    private class TCPTimeoutHandler extends TimerTask {
+    private class TcpTimeoutHandler extends TimerTask {
         @Override
         public void run() {
-            log.info("{} TIMEOUT!", hasSynAcked ? "SYN-ACK" : "ACK");
-            log.info("-------------------------------------------------");
+            log.info("------------------ [ FAILED ] ------------------");
+            flowRuleService.removeFlowRulesById(appId);
+            enableDetection = false;
+        }
+    }
+
+    private class UdpTimeoutHandler extends TimerTask {
+        @Override
+        public void run() {
+            if (!recvDstAck) {
+                log.info("{} --> {} may fail, even reversely", srcIP, dstIP);
+            } else {
+                log.info("{} <-- {} may fail", srcIP, dstIP);
+            }
+            log.info("------------------ [ FAILED ] ------------------");
+            flowRuleService.removeFlowRulesById(appId);
         }
     }
 }

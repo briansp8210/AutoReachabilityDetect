@@ -18,7 +18,6 @@ package nctu.sdnfv.AutoReachabilityDetect;
 import org.apache.karaf.shell.commands.Argument;
 import org.apache.karaf.shell.commands.Command;
 import org.apache.karaf.shell.commands.Option;
-import org.onlab.packet.Ip4Address;
 import org.onosproject.cli.AbstractShellCommand;
 import nctu.sdnfv.AutoReachabilityDetect.AppComponentService;
 import nctu.sdnfv.AutoReachabilityDetect.AppComponentService.Protocol;
@@ -43,7 +42,7 @@ public class AppCommand extends AbstractShellCommand {
             required = false)
     int count;
 
-    @Option(name = "-W", description = "Time to wait for a response (in seconds).",
+    @Option(name = "-W", description = "Time to wait for a response (in seconds).", 
             required = false)
     int timeout;
 
